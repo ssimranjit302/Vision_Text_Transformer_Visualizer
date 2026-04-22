@@ -1,0 +1,975 @@
+# Differential Attention Vision Transformer — Complete Deep Dive
+
+> A ground-up, end-to-end explanation. No prior Transformer knowledge assumed.
+
+---
+
+# Part 1: Foundations — What is Attention?
+
+## 1.1 The Core Problem: How Do Tokens Talk to Each Other?
+
+Imagine you have a sentence: *"The cat sat on the mat"*. Each word carries meaning, but that meaning **depends on context**. "Sat" means different things depending on WHO sat and WHERE. We need a mechanism where each token can **look at every other token** and decide which ones are relevant.
+
+This is **self-attention**: a mechanism where every element in a sequence computes a weighted combination of all other elements, with the weights determined by **relevance**.
+
+## 1.2 Query, Key, Value — The Library Analogy
+
+Think of a library:
+
+| Concept | Library Analogy | Mathematical Role |
+|---|---|---|
+| **Query (Q)** | Your question: "I need a book about cats" | What this token is *looking for* |
+| **Key (K)** | Each book's title/label on the shelf | What each token *advertises* itself as |
+| **Value (V)** | The actual book content | What each token actually *contains* |
+
+**Flow:**
+1. You walk in with your **Query** (what you're looking for)
+2. You compare your Query against every book's **Key** (title) → get relevance scores
+3. You read the **Value** (content) of the most relevant books, weighted by relevance
+
+## 1.3 The Math — Step by Step
+
+Given an input sequence $X \in \mathbb{R}^{T \times C}$ (T tokens, each C-dimensional):
+
+**Step 1: Project into Q, K, V**
+$$Q = X W_Q, \quad K = X W_K, \quad V = X W_V$$
+
+Where $W_Q, W_K \in \mathbb{R}^{C \times d_k}$ and $W_V \in \mathbb{R}^{C \times d_v}$.
+
+These are learnable linear transformations — the model learns WHAT to query for, WHAT to advertise as keys, and WHAT to provide as values.
+
+**Step 2: Compute attention scores**
+$$\text{scores} = Q K^\top \in \mathbb{R}^{T \times T}$$
+
+This is a dot product between every query and every key. High dot product = high relevance.
+
+Entry $(i, j)$ = how much token $i$ should attend to token $j$.
+
+**Step 3: Scale**
+$$\text{scores} = \frac{Q K^\top}{\sqrt{d_k}}$$
+
+Why divide by $\sqrt{d_k}$? Without scaling, dot products grow proportionally to dimension $d_k$. Large values push softmax into saturation (near 0 or 1), causing vanishing gradients. Scaling keeps the variance ≈ 1.
+
+> [!NOTE]
+> **Proof**: If $q_i, k_j \sim \mathcal{N}(0, 1)$ independently, then $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$ has variance $d_k$ (sum of $d_k$ independent unit-variance products). Dividing by $\sqrt{d_k}$ normalizes the variance to 1.
+
+**Step 4: Softmax**
+$$\alpha_{ij} = \frac{e^{\text{score}_{ij}}}{\sum_{k=1}^{T} e^{\text{score}_{ik}}}$$
+
+Converts scores to **probabilities** (non-negative, sum to 1 per row). Each row defines a distribution over which tokens to attend to.
+
+**Step 5: Weighted sum of values**
+$$\text{out}_i = \sum_{j=1}^{T} \alpha_{ij} \cdot V_j$$
+
+Each token's output is a weighted blend of all value vectors, weighted by attention probabilities.
+
+### Concrete Numerical Example
+
+Let's trace through with 3 tokens, dimension 4:
+
+```
+Input X:                    (3 tokens × 4 dims)
+  Token 0: [1.0, 0.5, -0.3, 0.8]
+  Token 1: [0.2, -1.0, 0.7, 0.1]
+  Token 2: [0.9, 0.3, 0.5, -0.2]
+
+After Q, K, V projections:  (3 tokens × 2 dims, for simplicity)
+  Q: [[0.8, 0.3],           K: [[0.5, 0.9],          V: [[0.1, 0.7],
+      [-0.2, 0.7],               [0.3, -0.4],              [-0.3, 0.5],
+      [0.6, 0.1]]                [0.8, 0.2]]               [0.4, -0.1]]
+
+Step 2: QKᵀ  (3×3 attention matrix)
+  scores[0,0] = 0.8×0.5 + 0.3×0.9 = 0.67
+  scores[0,1] = 0.8×0.3 + 0.3×(-0.4) = 0.12
+  scores[0,2] = 0.8×0.8 + 0.3×0.2 = 0.70
+  ... (fill the rest similarly)
+
+  scores = [[0.67, 0.12, 0.70],
+            [...,  ...,  ...],
+            [...,  ...,  ...]]
+
+Step 3: Scale by 1/√2 ≈ 0.707
+  scaled = [[0.47, 0.08, 0.49],
+            [...,  ...,  ...],
+            [...,  ...,  ...]]
+
+Step 4: Softmax (per row)
+  Row 0: [e^0.47, e^0.08, e^0.49] = [1.60, 1.08, 1.63]
+  Sum = 4.31
+  α = [0.37, 0.25, 0.38]   ← Token 0 attends ~equally to Token 0 and 2
+
+Step 5: Weighted sum
+  out[0] = 0.37 × V[0] + 0.25 × V[1] + 0.38 × V[2]
+         = 0.37×[0.1,0.7] + 0.25×[-0.3,0.5] + 0.38×[0.4,-0.1]
+         = [0.037+(-0.075)+0.152, 0.259+0.125+(-0.038)]
+         = [0.114, 0.346]
+```
+
+Token 0's output is a blend of all three value vectors, weighted by how relevant their keys were to Token 0's query.
+
+---
+
+## 1.4 Multi-Head Attention — Multiple Perspectives
+
+One attention head can only capture ONE type of relationship. But tokens relate to each other in many ways:
+- Spatial proximity (nearby patches in an image)
+- Semantic similarity (similar objects)
+- Structural patterns (edges, textures)
+
+**Solution**: Run **multiple attention heads in parallel**, each with its own Q/K/V projections, then concatenate:
+
+```
+         Input x: (B, T, C=128)
+        ┌────┬────┬────┬────┐
+        │    │    │    │    │
+        ▼    ▼    ▼    ▼    │
+     Head 0  Head 1  Head 2  Head 3
+     d=32   d=32    d=32    d=32
+        │    │    │    │
+        ▼    ▼    ▼    ▼
+     Concat: (B, T, 128)    ← 4 × 32 = 128
+        │
+        ▼
+     Linear Projection (128 → 128)
+        │
+        ▼
+     Output: (B, T, 128)
+```
+
+Each head has its own $W_Q, W_K, W_V$ matrices of size $(128 \times 32)$, so each head operates in a 32-dimensional subspace. Together, 4 heads × 32 dims = 128 dims = full embedding dimension.
+
+> [!IMPORTANT]
+> The key insight: by splitting into heads, we DON'T increase the total computation compared to a single large attention head. We just partition the embedding space. But the model can now learn **4 different attention patterns simultaneously**.
+
+---
+
+## 1.5 The Transformer Block
+
+Each Transformer block combines attention with a feedforward network:
+
+```
+      x ──────────────────────┐
+      │                       │ (residual connection)
+      ▼                       │
+   LayerNorm                  │
+      │                       │
+      ▼                       │
+   Multi-Head Attention        │
+      │                       │
+      ▼                       │
+    + ◄───────────────────────┘   ← x + Attn(LN(x))
+      │
+      │──────────────────────┐
+      │                      │ (residual connection)
+      ▼                      │
+   LayerNorm                 │
+      │                      │
+      ▼                      │
+   Feed-Forward Network      │
+      │                      │
+      ▼                      │
+    + ◄──────────────────────┘   ← x + FFN(LN(x))
+      │
+      ▼
+   output
+```
+
+### Why Residual Connections?
+
+Without residuals, deep networks suffer from **degradation** — adding more layers makes performance WORSE because gradients get weaker as they flow backwards through many layers.
+
+Residual connection: $\text{out} = x + F(x)$
+
+- During backpropagation, the gradient of identity $x$ is always 1. So gradients can flow directly through the skip connection, even if $F(x)$'s gradients vanish.
+- The network only needs to learn the **residual** $F(x) = \text{desired output} - x$, which is often easier than learning the full mapping.
+
+### Why LayerNorm?
+
+LayerNorm normalizes activations **across the feature dimension** for each token independently:
+
+$$\text{LN}(x_i) = \frac{x_i - \mu_i}{\sigma_i} \cdot \gamma + \beta$$
+
+Where $\mu_i, \sigma_i$ are the mean and std of token $i$'s features, and $\gamma, \beta$ are learnable scale/shift parameters.
+
+**Why Pre-norm (LN before attention/FFN)?** 
+- This code uses Pre-LayerNorm: `self.sa(self.ln1(x))`
+- Alternative: Post-LayerNorm: `self.ln1(x + self.sa(x))`
+- Pre-norm is more stable for training because the input to each sub-layer is always normalized, preventing activation magnitudes from exploding across layers.
+
+### The Feed-Forward Network (FFN)
+
+```python
+nn.Sequential(
+    nn.Linear(n_embd, 4 * n_embd),    # 128 → 512  (expand)
+    nn.ReLU(),                          # non-linearity
+    nn.Linear(4 * n_embd, n_embd),     # 512 → 128  (compress)
+)
+```
+
+**Purpose**: Attention handles **inter-token** communication. FFN handles **per-token** computation — it's like giving each token a chance to "think" about what it just learned from other tokens.
+
+The 4× expansion creates a higher-dimensional intermediate representation, giving the network more expressivity. ReLU introduces non-linearity (without it, stacking linear layers would just be one big linear layer).
+
+---
+
+# Part 2: Vision Transformer (ViT) — Transformers for Images
+
+## 2.1 The Key Insight: Images as Sequences
+
+Transformers need a **sequence** of tokens. An image is a 2D grid of pixels. How to bridge this?
+
+**ViT's answer**: Chop the image into a grid of **patches**, treat each patch as a "word."
+
+```
+  Original Image (32×32 pixels, RGB)
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │ P0 │ P1 │ P2 │ P3 │ P4 │ P5 │ P6 │ P7 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │ P8 │ P9 │P10 │P11 │P12 │P13 │P14 │P15 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │P16 │P17 │P18 │P19 │P20 │P21 │P22 │P23 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │P24 │P25 │P26 │P27 │P28 │P29 │P30 │P31 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │P32 │P33 │P34 │P35 │P36 │P37 │P38 │P39 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │P40 │P41 │P42 │P43 │P44 │P45 │P46 │P47 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │P48 │P49 │P50 │P51 │P52 │P53 │P54 │P55 │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │P56 │P57 │P58 │P59 │P60 │P61 │P62 │P63 │
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+
+  Each patch: 4×4 pixels × 3 channels = 48 values
+  Total: 8×8 = 64 patches
+```
+
+## 2.2 Patch Embedding — `Conv2d` as a Patch Extractor
+
+The clever trick: a `Conv2d` with `kernel_size=patch_size` and `stride=patch_size` simultaneously extracts patches AND projects them:
+
+```python
+self.proj = nn.Conv2d(3, 128, kernel_size=4, stride=4)
+```
+
+**What Conv2d does here:**
+
+```
+  Input: (B, 3, 32, 32)
+         ↑  ↑   ↑   ↑
+     batch  RGB  H   W
+
+  The convolution slides a 4×4 kernel across the image with stride 4.
+  Since stride = kernel_size, there's NO overlap between patches.
+
+  At each position, it computes:
+    output_channel_k = Σ(patch_pixels × filter_k_weights) + bias_k
+
+  With 128 output channels, we get 128 features per patch position.
+
+  Output: (B, 128, 8, 8)    ← 8×8 grid of 128-dim patch embeddings
+         ↑   ↑   ↑ ↑
+     batch embed H W (in patch grid coordinates)
+```
+
+**Reshape to sequence format:**
+```python
+x = x.flatten(2)         # (B, 128, 8, 8) → (B, 128, 64)    merge spatial dims
+x = x.transpose(1, 2)    # (B, 128, 64) → (B, 64, 128)      now: 64 tokens × 128-dim
+```
+
+This is **mathematically equivalent** to:
+1. Extracting all 64 non-overlapping 4×4×3 patches (each = 48 values)
+2. Applying a linear layer: 48 → 128
+
+But `Conv2d` does it in one efficient GPU operation.
+
+## 2.3 The [CLS] Token — A Global Aggregator
+
+```python
+self.cls_token = nn.Parameter(torch.zeros(1, 1, n_embd))  # Learnable (1, 1, 128)
+
+# In forward:
+cls = self.cls_token.expand(B, -1, -1)   # (B, 1, 128) — replicate for batch
+x = torch.cat([cls, x], dim=1)           # (B, 65, 128) — prepend to patches
+```
+
+**Why a [CLS] token?**
+
+The Transformer processes all 65 tokens through self-attention. Every token can attend to every other token. After 6 layers, the [CLS] token has "talked to" every patch token (directly and indirectly).
+
+At the end, we **only** use the [CLS] token for classification:
+```python
+cls_token = x[:, 0]           # Extract first token = [CLS]
+logits = self.head(cls_token)  # Linear(128 → 10)
+```
+
+> [!TIP]
+> **Why not average all patch tokens?** (This works too and is called "global average pooling".) The [CLS] token approach lets the model learn a dedicated aggregation strategy through attention — the [CLS] learns to query for the most discriminative features across all patches.
+
+## 2.4 Positional Embeddings — Where Am I?
+
+Self-attention is **permutation-equivariant**: if you shuffle the input tokens, the output gets shuffled the same way. The operation itself doesn't know about token ORDER or POSITION.
+
+But for images, position matters! Patch 0 (top-left corner) is fundamentally different from Patch 63 (bottom-right corner).
+
+```python
+self.pos_embed = nn.Parameter(torch.randn(1, 65, 128))  # Learnable (65 positions × 128-dim)
+
+# In forward:
+x = x + self.pos_embed  # Add position information to each token
+```
+
+Each of the 65 positions (1 CLS + 64 patches) gets a **unique, learnable** 128-dim vector added to it. After training, these vectors encode spatial structure — nearby patches will have similar positional embeddings.
+
+```
+  Token sequence after prepending [CLS]:
+  
+  Position:  0      1      2      3    ...    64
+  Token:   [CLS]  [P_0]  [P_1]  [P_2] ...  [P_63]
+             │      │      │      │            │
+             +      +      +      +            +
+             │      │      │      │            │
+  PosEmb:  PE_0   PE_1   PE_2   PE_3  ...   PE_64
+             │      │      │      │            │
+             ▼      ▼      ▼      ▼            ▼
+  Result:  [CLS    patch   patch  patch ...   patch
+           +pos]  +pos]   +pos]  +pos]       +pos]
+```
+
+---
+
+# Part 3: Differential Attention — The Core Innovation
+
+## 3.1 The Problem with Standard Attention
+
+Standard softmax attention has a fundamental issue: **attention noise**.
+
+After softmax, every attention weight is positive and sums to 1. This means:
+- Even completely irrelevant tokens get SOME weight (softmax can't output exactly 0)
+- With 65 tokens, the "noise floor" is roughly $1/65 \approx 1.5\%$ per irrelevant token
+- If only 5 tokens are truly relevant, the other 60 tokens collectively steal $60 \times 1.5\% = 90\%$ of the attention!
+
+This noise accumulates across layers and heads, degrading the quality of representations.
+
+### Visualizing the Problem
+
+```
+Standard Attention (Row for Token 5 — a "cat ear" patch):
+
+Relevant patches:  ■ (other cat body parts)
+Irrelevant:        □ (background patches)
+
+Ideal:     [0  0  0  ■.3  ■.3  ■.4  0  0  0  0  0  0  ...]
+                      ↑    ↑    ↑
+                    other cat parts
+
+Reality:   [□.01 □.01 □.02 ■.15 ■.12 ■.18 □.01 □.02 □.01 □.01 □.01 □.01 ...]
+                            ↑    ↑    ↑
+                         still highest, but ~55% of weight wasted on noise!
+```
+
+## 3.2 How Differential Attention Solves This
+
+**Key insight**: If two independently initialized attention heads both attend to a token, that signal is **real**. If only one attends to it, it's likely **noise**.
+
+By subtracting: $A_1 - \alpha \cdot A_2$, shared noise cancels while true signal (present in $A_1$ more than $A_2$) survives.
+
+```
+Head 1 (A₁):  [0.02  0.01  0.01  0.20  0.15  0.25  0.02  0.01  0.01  ...]
+                 ↑noise              ↑↑↑ signal ↑↑↑           ↑noise
+
+Head 2 (A₂):  [0.02  0.02  0.01  0.05  0.04  0.06  0.01  0.02  0.01  ...]
+                 ↑noise              ↑ some    signal          ↑noise
+
+Differential (A₁ - 0.5·A₂):
+               [0.01  0.00  0.005 0.175 0.13  0.22  0.015 0.00  0.005 ...]
+                 ↑reduced!              ↑↑↑ preserved! ↑↑↑     ↑reduced!
+```
+
+The noise at irrelevant positions (which was similar in both heads) gets **suppressed**, while the signal at relevant positions (which was stronger in Head 1) gets **preserved**.
+
+## 3.3 The DiffHead Implementation — Line by Line
+
+```python
+class DiffHead(nn.Module):
+    def __init__(self, head_size):    # head_size = 128/4 = 32
+        super().__init__()
+
+        # ------- Branch 1 -------
+        self.key1 = nn.Linear(n_embd, head_size, bias=False)     # W_K1: 128→32
+        self.query1 = nn.Linear(n_embd, head_size, bias=False)   # W_Q1: 128→32
+
+        # ------- Branch 2 -------
+        self.key2 = nn.Linear(n_embd, head_size, bias=False)     # W_K2: 128→32
+        self.query2 = nn.Linear(n_embd, head_size, bias=False)   # W_Q2: 128→32
+
+        # ------- Shared Value -------
+        self.value = nn.Linear(n_embd, head_size, bias=False)    # W_V: 128→32
+
+        # ------- Learnable subtraction weight -------
+        self.alpha = nn.Parameter(torch.tensor(0.5))             # Scalar, learnable
+```
+
+**Parameter count per DiffHead:**
+- Branch 1: $W_{Q1}(128 \times 32) + W_{K1}(128 \times 32) = 8192$
+- Branch 2: $W_{Q2}(128 \times 32) + W_{K2}(128 \times 32) = 8192$
+- Value: $W_V(128 \times 32) = 4096$
+- Alpha: 1
+- **Total: 20,481 per head** (vs 12,288 for standard attention head)
+
+```python
+    def forward(self, x):
+        B, T, C = x.shape    # B=batch, T=65 tokens, C=128 embedding dim
+
+        # ------- Branch 1: Compute attention map 1 -------
+        k1 = self.key1(x)                           # (B, 65, 32)
+        q1 = self.query1(x)                          # (B, 65, 32)
+        wei1 = q1 @ k1.transpose(-2, -1) * C**-0.5  # (B, 65, 65) scaled dot product
+```
+
+> [!WARNING]
+> **Subtle detail**: The scaling factor here is `C**-0.5` = $1/\sqrt{128} \approx 0.088$, which uses the full embedding dimension $C=128$, not the head dimension $d_k=32$. Using $1/\sqrt{C}$ instead of $1/\sqrt{d_k}$ is unconventional — standard transformers use $1/\sqrt{d_k}$. This makes the scores smaller, which makes softmax distributions more uniform. In the context of Differential Attention, this might be intentional to prevent either branch from collapsing before subtraction.
+
+```python
+        # ------- Branch 2: Compute attention map 2 -------
+        k2 = self.key2(x)                           # (B, 65, 32)
+        q2 = self.query2(x)                          # (B, 65, 32)
+        wei2 = q2 @ k2.transpose(-2, -1) * C**-0.5  # (B, 65, 65)
+
+        # ------- Apply softmax BEFORE subtraction -------
+        wei1 = F.softmax(wei1, dim=-1)  # Each row sums to 1
+        wei2 = F.softmax(wei2, dim=-1)  # Each row sums to 1
+
+        # ------- THE DIFFERENTIAL STEP -------
+        wei = wei1 - self.alpha * wei2   # (B, 65, 65)
+```
+
+**Critical detail**: Softmax is applied **before** subtraction, not after. This means:
+- Each branch independently produces valid probability distributions
+- The subtraction happens in "probability space"
+- The result `wei` can have **negative** entries — this is intentional (see below)
+
+**Properties of the differential attention matrix** $A = A_1 - \alpha \cdot A_2$:
+- Row sums: each row of $A_1$ sums to 1, each row of $A_2$ sums to 1, so each row of $A$ sums to $1 - \alpha$ (when $\alpha = 0.5$, rows sum to 0.5)
+- Range: entries can be from $-\alpha$ to $+1$ (when $\alpha = 0.5$: from $-0.5$ to $+1$)
+- **Negative values = active inhibition** — the model can explicitly SUPPRESS certain token interactions
+
+```python
+        # ------- Apply to shared values -------
+        v = self.value(x)    # (B, 65, 32)
+        out = wei @ v        # (B, 65, 32) — weighted sum using diff attention
+
+        return out, wei      # Also return attention map for stable rank analysis
+```
+
+### The Learnable Alpha ($\alpha$)
+
+```python
+self.alpha = nn.Parameter(torch.tensor(0.5))
+```
+
+$\alpha$ controls the **subtraction strength**:
+
+| $\alpha$ Value | Behavior |
+|---|---|
+| $\alpha = 0$ | No subtraction → falls back to standard attention (Branch 1 only) |
+| $\alpha = 0.5$ | Balanced subtraction (initialized here) |
+| $\alpha = 1$ | Full subtraction → $A_1 - A_2$, rows sum to 0 |
+| $\alpha > 1$ | Over-subtraction → Branch 2 dominates (with sign flip) |
+
+Being a `nn.Parameter`, $\alpha$ is updated by gradient descent. Different heads and layers may learn **different** optimal $\alpha$ values, adapting the noise cancellation strength to each layer's needs.
+
+---
+
+## 3.4 Multi-Head Assembly
+
+```python
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        self.heads = nn.ModuleList([DiffHead(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)   # Output projection: 128→128
+
+    def forward(self, x):
+        # Run all 4 heads in parallel
+        outs, attns = zip(*[h(x) for h in self.heads])
+
+        # Concatenate head outputs: 4 × (B,65,32) → (B,65,128)
+        out = torch.cat(outs, dim=-1)
+
+        # Final linear projection (mixes information across heads)
+        out = self.proj(out)
+
+        # Stack attention maps for analysis: (B,4,65,65)
+        attn = torch.stack(attns, dim=1)
+        return out, attn
+```
+
+**Why the output projection `self.proj`?**
+
+After concatenation, each 32-dim slice of the 128-dim output came from a different head. The projection matrix allows **cross-head information flow** — head 0's features can influence the output positions originally computed by head 3, and vice versa.
+
+---
+
+# Part 4: The Complete ViT Architecture
+
+## 4.1 Putting It All Together — `ViT_LN`
+
+```python
+class ViT_LN(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # ---- Patch Embedding ----
+        self.patch_embed = PatchEmbedding(patch_size=4, embed_dim=128)
+        num_patches = self.patch_embed.n_patches   # = 64
+
+        # ---- Special Tokens & Positional Encoding ----
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, 128))
+        self.pos_embed = nn.Parameter(torch.randn(1, 65, 128))
+
+        # ---- 6 Transformer Blocks ----
+        self.blocks = nn.ModuleList([
+            LNBlock(128, 4) for _ in range(6)
+        ])
+
+        # ---- Classification Head ----
+        self.ln_f = nn.LayerNorm(128)
+        self.head = nn.Linear(128, 10)
+```
+
+## 4.2 The Complete Forward Pass — Tensor Shapes at Every Step
+
+```python
+def forward(self, x, compute_sr=False):     # x: (B, 3, 32, 32)
+    B = x.size(0)                            # e.g., B=128 (batch size)
+```
+
+**Step 1: Patch embedding**
+```python
+    x = self.patch_embed(x)                  # (128, 3, 32, 32) → (128, 64, 128)
+    #                                            B   C   H   W      B    T   emb
+```
+
+**Step 2: Prepend [CLS] token**
+```python
+    cls = self.cls_token.expand(B, -1, -1)   # (1, 1, 128) → (128, 1, 128)
+    x = torch.cat([cls, x], dim=1)           # (128, 65, 128)
+    #                                            B    T   emb
+    #                                            ↑    ↑
+    #                                        batch  1 CLS + 64 patches
+```
+
+`expand` doesn't copy memory — it creates a view with repeated data. Efficient!
+
+**Step 3: Add positional embeddings**
+```python
+    x = x + self.pos_embed                   # (128, 65, 128) + (1, 65, 128)
+    #                                        Broadcasting: same PE for all batch items
+```
+
+**Step 4: Process through 6 Transformer blocks**
+```python
+    layer_srs = []
+
+    for block in self.blocks:                # 6 iterations
+        x, attn = block(x)                   # x: (128, 65, 128)
+        #                                      attn: (128, 4, 65, 65)
+        #                                             B    H   T   T
+
+        if compute_sr:
+            sr = stable_rank(attn)            # scalar: avg stable rank
+            layer_srs.append(sr)              # one per layer
+```
+
+Each block:
+1. LayerNorm → Differential Multi-Head Attention → Residual add
+2. LayerNorm → FFN → Residual add
+
+After 6 blocks, the [CLS] token has attended (directly or indirectly) to every patch.
+
+**Step 5: Extract [CLS] and classify**
+```python
+    x = self.ln_f(x)                         # Final LayerNorm: (128, 65, 128)
+    cls_token = x[:, 0]                      # (128, 128) — just the CLS token
+    logits = self.head(cls_token)             # (128, 10) — class probabilities
+    return logits, layer_srs
+```
+
+### Full Architecture Diagram with Tensor Shapes
+
+```
+  Input: (B, 3, 32, 32)
+  ═══════════════════════════════════════════════════════════
+  
+  PatchEmbed [Conv2d(3→128, k=4, s=4)]
+  ─────────────────────────────────────
+  → (B, 64, 128)
+  
+  Prepend [CLS]: cat along dim=1
+  ────────────────────────────────
+  → (B, 65, 128)
+  
+  + Positional Embedding (1, 65, 128)
+  ────────────────────────────────────
+  → (B, 65, 128)
+  
+  ╔═══════════════════════════════════════════════════╗
+  ║  Transformer Block × 6                            ║
+  ║  ┌─────────────────────────────────────────────┐  ║
+  ║  │ LN → DiffMultiHeadAttn(4 heads) → + residual│  ║
+  ║  │ LN → FFN(128→512→128) → + residual          │  ║
+  ║  └─────────────────────────────────────────────┘  ║
+  ║  → (B, 65, 128) at each layer                    ║
+  ║  → attn: (B, 4, 65, 65) [returned for SR]       ║
+  ╚═══════════════════════════════════════════════════╝
+  
+  Final LayerNorm
+  ────────────────
+  → (B, 65, 128)
+  
+  Extract CLS: x[:, 0]
+  ──────────────────────
+  → (B, 128)
+  
+  Classification Head [Linear(128→10)]
+  ─────────────────────────────────────
+  → (B, 10)     ← logits for 10 CIFAR classes
+```
+
+---
+
+# Part 5: Training Infrastructure & Diagnostics
+
+## 5.1 Gradient Norm — Training Health Monitor
+
+```python
+def grad_norm(model):
+    total_norm = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_norm += p.grad.data.norm(2).item() ** 2
+    return total_norm ** 0.5
+```
+
+This computes the **global L2 norm** of all parameter gradients:
+
+$$\|\nabla \theta\|_2 = \sqrt{\sum_{\text{all params}} \|\nabla p\|_2^2}$$
+
+**How to read the gradient norm plot:**
+
+```
+Gradient Norm
+  │
+  │     ╱╲
+  │    ╱  ╲     Spike = sudden instability
+  │   ╱    ╲        (bad learning rate,
+  │──╱──────╲──────── batch of hard examples,
+  │ ╱        ╲        or numerical issues)
+  │╱          ╲───────────────── Settling = healthy training
+  │
+  └────────────────────────────── Steps
+  
+  If it goes to 0 → vanishing gradients → model stopped learning
+  If it explodes → divergence → training is failing
+  Steady moderate values → healthy training
+```
+
+## 5.2 Stable Rank — Attention Quality Monitor
+
+```python
+def stable_rank(A):
+    with torch.no_grad():                      # No gradient needed for diagnostics
+        A = A[:, :2, :, :]                     # (B, 2, 65, 65) — only first 2 heads
+        
+        B, H, T, _ = A.shape
+        A = A.reshape(B * H, T, T)             # (B*2, 65, 65) — flatten batch & heads
+        
+        S = torch.linalg.svdvals(A.cpu())      # (B*2, 65) — singular values
+        
+        sr = (S**2).sum(dim=-1) / (S[:,0]**2 + 1e-8)   # Stable rank formula
+        return sr.mean().item()                 # Average over batch and heads
+```
+
+### Singular Value Decomposition (SVD) — Quick Primer
+
+Any matrix $A \in \mathbb{R}^{m \times n}$ can be decomposed as:
+
+$$A = U \Sigma V^\top$$
+
+Where $\Sigma = \text{diag}(\sigma_1, \sigma_2, \dots)$ with $\sigma_1 \geq \sigma_2 \geq \dots \geq 0$.
+
+The singular values tell you how much "energy" each orthogonal direction carries:
+- If $\sigma_1 \gg \sigma_2 \gg \dots$ → matrix is nearly rank-1 (information concentrated in one direction)
+- If $\sigma_1 \approx \sigma_2 \approx \dots$ → matrix uses many directions (diverse information)
+
+**Stable rank** = $\frac{\sum \sigma_i^2}{\sigma_1^2}$ captures this:
+
+```
+  Case 1: Collapsed attention (rank ≈ 1)
+    σ = [10.0, 0.1, 0.01, ...]
+    SR = (100 + 0.01 + 0.0001) / 100 ≈ 1.0
+
+  Case 2: Uniform attention (rank ≈ T)
+    σ = [1.0, 1.0, 1.0, ..., 1.0]    (65 equal values)
+    SR = 65 / 1 = 65.0
+
+  Case 3: Healthy attention (selective but diverse)
+    σ = [5.0, 3.0, 2.0, 1.0, 0.5, ...]
+    SR = (25+9+4+1+0.25) / 25 ≈ 1.57
+```
+
+### Why Only 2 Heads?
+
+```python
+A = A[:, :2, :, :]  # Use only first 2 of 4 heads
+```
+
+SVD is expensive: $O(T^3)$ per matrix, with $T=65$ and batch size 128. Computing SVD for all 4 heads × 128 batches = 512 SVDs per analysis step would significantly slow training. Using 2 heads is a practical trade-off.
+
+### Why `.cpu()`?
+
+```python
+S = torch.linalg.svdvals(A.cpu())
+```
+
+SVD on GPU can be numerically unstable for certain matrix types (especially near-singular attention matrices). CPU SVD uses higher-precision LAPACK routines. The cost of CPU transfer is negligible since we only do this every 50 steps.
+
+## 5.3 The Training Loop — Full Annotated Version
+
+```python
+model = ViT_LN().to(device)                              # Move model to GPU
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW optimizer
+criterion = nn.CrossEntropyLoss()                          # Multi-class loss
+
+# Storage for plotting
+train_losses = []
+grad_norms = []
+overall_sr_history = []
+per_layer_sr_history = [[] for _ in range(n_layer)]        # 6 empty lists
+
+step = 0
+
+for epoch in range(5):
+    model.train()                          # Enable training mode (dropout, batchnorm)
+    epoch_loss = 0
+
+    for imgs, labels in tqdm(trainloader):
+        imgs = imgs.to(device)             # (128, 3, 32, 32) → GPU
+        labels = labels.to(device)         # (128,) — integer class labels
+
+        step += 1
+        optimizer.zero_grad()              # Reset gradients from previous step
+
+        # ---- Should we compute stable rank this step? ----
+        compute_sr = (step % 50 == 0)      # Every 50 steps (saves time)
+
+        # ---- Forward pass ----
+        outputs, layer_srs = model(imgs, compute_sr=compute_sr)
+        # outputs: (128, 10) — logits for 10 classes
+        # layer_srs: [] or [sr0, sr1, sr2, sr3, sr4, sr5]
+
+        # ---- Compute loss ----
+        loss = criterion(outputs, labels)
+        # Cross-entropy: -log(softmax(logits)[correct_class])
+        # Low when model predicts correct class with high confidence
+
+        # ---- Backward pass ----
+        loss.backward()
+        # Computes ∂loss/∂param for every parameter via backpropagation
+
+        # ---- Log gradient norm ----
+        grad_norms.append(grad_norm(model))
+
+        # ---- Log stable ranks (if computed) ----
+        if compute_sr:
+            overall_sr = sum(layer_srs) / len(layer_srs)
+            overall_sr_history.append(overall_sr)
+
+            for i, sr in enumerate(layer_srs):
+                per_layer_sr_history[i].append(sr)
+
+        # ---- Update parameters ----
+        optimizer.step()
+        # θ_new = θ_old - lr × (adapted_gradient)
+        # AdamW applies adaptive learning rates + weight decay
+
+        epoch_loss += loss.item()
+
+    # ---- End of epoch ----
+    train_losses.append(epoch_loss / len(trainloader))
+    print(f"Epoch {epoch}, Loss: {train_losses[-1]}")
+```
+
+### Training Numbers
+
+| Metric | Value | Calculation |
+|---|---|---|
+| Training images | 50,000 | CIFAR-10 train set |
+| Batch size | 128 | |
+| Steps per epoch | ~391 | 50,000 / 128 ≈ 391 |
+| Total steps | ~1,955 | 391 × 5 epochs |
+| SR measurements | ~39 | 1,955 / 50 = ~39 data points |
+| Grad norm points | ~1,955 | One per step |
+| Loss points | 5 | One per epoch |
+
+## 5.4 AdamW Optimizer — Why Not Plain SGD?
+
+```python
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+```
+
+**AdamW** = Adam with decoupled weight decay. It maintains:
+- First moment estimate $m$ (running average of gradients — "momentum")
+- Second moment estimate $v$ (running average of squared gradients — "adaptive lr")
+
+Update rule:
+$$m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t$$
+$$v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2$$
+$$\theta_{t+1} = \theta_t - \text{lr} \cdot \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} - \lambda \theta_t$$
+
+Where $\lambda \theta_t$ is weight decay (L2 regularization, applied directly to weights).
+
+**Why AdamW for Transformers?**
+- Adaptive per-parameter learning rates handle the diverse gradient scales across attention, FFN, embeddings, and normalization layers
+- Weight decay prevents overfitting without interfering with Adam's moment estimates
+- The lr=3e-4 is a well-known sweet spot for Adam-family optimizers on moderate-sized models
+
+## 5.5 Cross-Entropy Loss
+
+```python
+criterion = nn.CrossEntropyLoss()
+loss = criterion(outputs, labels)
+```
+
+For a single sample with true class $y$ and logits $z$:
+
+$$\mathcal{L} = -z_y + \log \sum_{c=0}^{9} e^{z_c}$$
+
+This is equivalent to: $\mathcal{L} = -\log \text{softmax}(z)_y$
+
+Intuitively: "How surprised are we that the correct class is $y$, given our predictions?" Low loss = model predicted correctly with high confidence.
+
+---
+
+# Part 6: Visualization & Interpretation
+
+## 6.1 Figure 1 — Three Diagnostic Panels
+
+```python
+plt.figure(figsize=(15,5))
+
+plt.subplot(1,3,1)
+plt.plot(train_losses)           # 5 points (1 per epoch)
+plt.title("Train Loss")
+
+plt.subplot(1,3,2)
+plt.plot(grad_norms)             # ~1955 points (1 per step)
+plt.title("Gradient Norm")
+
+plt.subplot(1,3,3)
+plt.plot(overall_sr_history)     # ~39 points (every 50 steps)
+plt.title("Overall Stable Rank")
+```
+
+**What healthy plots look like:**
+
+```
+Train Loss          Gradient Norm         Overall Stable Rank
+  │\                 │                     │
+  │ \                │╱╲╱╲                 │         ╱────────
+  │  \               │    ╲╱╲╱╲           │       ╱
+  │   \──            │         ╲───        │─────╱
+  │     \──          │                     │
+  │       \─         │                     │
+  └──────── Epoch    └──────── Step        └──────── Step
+
+  ↓ Decreasing       Moderate & stable     Moderate & stable
+  = Model learning   = Stable training     = Healthy attention
+```
+
+## 6.2 Figure 2 — Per-Layer Stable Rank
+
+```python
+plt.figure(figsize=(10,6))
+for i in range(n_layer):
+    plt.plot(per_layer_sr_history[i], label=f"Layer {i}")
+plt.title("Stable Rank per Layer")
+plt.legend()
+```
+
+**Expected patterns:**
+
+```
+Stable Rank
+  │
+  │  Layer 0 ─────────────────── (highest: early layers = broad, exploratory attention)
+  │  Layer 1 ──────────────── 
+  │  Layer 2 ─────────────
+  │  Layer 3 ──────────
+  │  Layer 4 ────────
+  │  Layer 5 ──────              (lowest: deep layers = focused, task-specific attention)
+  │
+  └──────────────────────── Steps
+```
+
+This pattern (higher SR in early layers, lower in deep layers) is expected and healthy:
+
+| Layer Depth | Expected Behavior | Why |
+|---|---|---|
+| Early (0-1) | High stable rank | Learning local features (edges, textures) — needs broad attention |
+| Middle (2-3) | Moderate stable rank | Combining local features — selective but diverse |
+| Deep (4-5) | Lower stable rank | Task-specific decisions — focused on discriminative features |
+
+---
+
+# Part 7: Complete Model Parameter Count
+
+| Component | Parameters | Calculation |
+|---|---|---|
+| PatchEmbed Conv2d | 6,272 | $(3 \times 4 \times 4 + 1) \times 128 = 49 \times 128$ (with bias) |
+| CLS token | 128 | $1 \times 128$ |
+| Positional embedding | 8,320 | $65 \times 128$ |
+| **Per DiffHead** | **20,481** | $4 \times (128 \times 32) + (128 \times 32) + 1$ |
+| **Per MultiHeadAttn** | **98,180** | $4 \times 20481 + 128 \times 128 + 128$ |
+| **Per FFN** | **131,584** | $128 \times 512 + 512 + 512 \times 128 + 128$ |
+| **Per LayerNorm** | **256** | $128 + 128$ (scale + shift) |
+| **Per LNBlock** | **230,276** | MHA + FFN + 2×LN |
+| **6 Blocks Total** | **1,381,656** | $6 \times 230276$ |
+| Final LN | 256 | |
+| Classification head | 1,290 | $128 \times 10 + 10$ |
+| **Grand Total** | **~1.4M** | All of the above |
+
+For comparison, a standard ViT with the same architecture (single Q/K per head) would have ~1.2M parameters. The differential mechanism adds ~17% more parameters due to the doubled Q/K projections.
+
+---
+
+# Summary
+
+```mermaid
+graph LR
+    A[Image 32×32] --> B[64 Patches]
+    B --> C[Linear Embed 128-dim]
+    C --> D[+ CLS + PosEmbed]
+    D --> E["6× Diff-Attn Blocks"]
+    E --> F[CLS Token]
+    F --> G[10-class Output]
+    
+    E --> H[Stable Rank Monitor]
+    E --> I[Grad Norm Monitor]
+    G --> J[Cross-Entropy Loss]
+    
+    style E fill:#ff6b6b,stroke:#333,color:#fff
+    style H fill:#4ecdc4,stroke:#333,color:#fff
+    style I fill:#4ecdc4,stroke:#333,color:#fff
+```
+
+| What | How | Why |
+|---|---|---|
+| Image → Tokens | Conv2d patch embedding | Efficient, GPU-friendly |
+| Token interaction | Differential Attention | Noise cancellation via dual-map subtraction |
+| Per-token processing | FFN (expand → ReLU → compress) | Non-linear feature transformation |
+| Gradient stability | Pre-LayerNorm + Residuals | Prevents vanishing/exploding gradients |
+| Classification | CLS token → Linear | Dedicated aggregation token |
+| Optimizer | AdamW | Adaptive LR + weight decay |
+| Health monitoring | Grad norm + Stable rank | Detect attention collapse early |

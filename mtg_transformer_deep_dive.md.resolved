@@ -1,0 +1,894 @@
+# MTG (Mind The Gap) Attention Vision Transformer — Complete Deep Dive
+
+> This document focuses on what's **unique** to the MTG code. For fundamentals (Q/K/V, softmax, multi-head attention, ViT patch embedding, [CLS] token, positional embeddings, residual connections, LayerNorm, FFN, stable rank, SVD, AdamW, cross-entropy), refer to the [Differential Transformer Deep Dive](file:///Users/simran/.gemini/antigravity/brain/8684e7c8-adf3-4a3c-b05b-1017d40e5a63/differential_transformer_deep_dive.md).
+
+---
+
+# Part 1: The Problem — Why Standard Attention Breaks
+
+## 1.1 Softmax Saturation: A Mathematical Deep Dive
+
+The softmax function converts raw scores $z = [z_1, z_2, \dots, z_T]$ into probabilities:
+
+$$\text{softmax}(z_i) = \frac{e^{z_i}}{\sum_{j=1}^T e^{z_j}}$$
+
+The critical property is that softmax is **exponentially sensitive to scale**. Let's prove why this causes attention collapse.
+
+### Theorem: Softmax Converges to One-Hot as Scale Increases
+
+Consider scores $z = [z_1, z_2, \dots, z_T]$ with a unique maximum $z_{\max} = z_k$. Define $\text{gap}_j = z_k - z_j > 0$ for $j \neq k$. Then:
+
+$$\text{softmax}(\beta z)_k = \frac{1}{1 + \sum_{j \neq k} e^{-\beta \cdot \text{gap}_j}} \xrightarrow{\beta \to \infty} 1$$
+
+As $\beta$ (the effective scale/inverse-temperature) grows, softmax converges to a one-hot vector concentrating all mass on the maximum.
+
+### Concrete Demonstration
+
+Take scores $z = [2.0, 1.5, 0.3, 0.1, 0.1]$ (5 tokens, one dominant):
+
+| Scale $\beta$ | softmax($\beta z$) | Entropy $H$ | Max weight |
+|---|---|---|---|
+| $\beta = 0.5$ | [0.27, 0.24, 0.18, 0.16, 0.16] | 1.58 | 27% |
+| $\beta = 1$ | [0.35, 0.21, 0.06, 0.05, 0.05] | 1.28 | 35% |
+| $\beta = 2$ | [0.63, 0.14, 0.01, 0.01, 0.01] | 0.71 | 63% |
+| $\beta = 5$ | [0.97, 0.008, 0.000, 0.000, 0.000] | 0.09 | 97% |
+| $\beta = 10$ | [0.999, ...] | ≈ 0 | 99.9% |
+
+**Entropy** $H = -\sum p_i \log p_i$ measures diversity:
+- $H = \log T = \log 5 = 1.61$ → perfectly uniform (max diversity)
+- $H = 0$ → one-hot (zero diversity, complete collapse)
+
+> [!WARNING]
+> **The hidden danger**: During training, Q and K projections are learned. As the model trains on more data, the learned projections tend to produce **increasingly disparate scores** — the effective $\beta$ grows organically, driving attention toward collapse even without any explicit temperature parameter.
+
+## 1.2 Why Does This Happen During Training?
+
+The scores are $\text{score}_{ij} = \frac{q_i \cdot k_j}{\sqrt{C}}$ where $q_i, k_j \in \mathbb{R}^{d_k}$.
+
+As training progresses:
+
+```
+Epoch 1 (random init):
+  Q, K weights are small, random
+  Scores: [-0.2, 0.1, -0.3, 0.15, 0.05, ...]
+  Variance of scores: ~0.04 (small)
+  Softmax: [0.013, 0.018, 0.012, 0.019, 0.017, ...]  ← ~uniform
+
+Epoch 10 (partially trained):
+  Q, K weights have grown, learned structure
+  Scores: [-1.5, 3.2, -0.8, 0.5, -2.1, ...]
+  Variance of scores: ~3.5 (growing!)
+  Softmax: [0.001, 0.92, 0.002, 0.006, 0.0005, ...]  ← collapsing!
+
+Epoch 50 (well-trained):
+  Scores: [-5.2, 12.8, -3.1, 1.2, -7.4, ...]
+  Variance of scores: ~45 (very large!)
+  Softmax: [0.0, 0.9999, 0.0, 0.0, 0.0, ...]  ← collapsed!
+```
+
+The **variance of attention scores grows** because the model learns to discriminate — but softmax converts this discrimination into near-deterministic (one-hot) attention, which is harmful because:
+
+1. **Gradient vanishing**: $\frac{\partial \text{softmax}_i}{\partial z_j} = p_i (\delta_{ij} - p_j)$. When $p_k \approx 1$ and all others $\approx 0$, all partial derivatives $\approx 0$.
+2. **Information bottleneck**: Each token's output is essentially just one other token's value — no blending, no context integration.
+3. **Representational collapse**: Multiple heads may converge to attending to the same dominant token.
+
+## 1.3 Three Approaches to Fix This
+
+```
+The Attention Collapse Problem
+         │
+    ┌────┴─────────────────────────────────┐
+    │                                      │
+    ▼                                      ▼
+"Fix it AFTER"                      "Prevent it BEFORE"
+    │                                      │
+    ▼                                      ▼
+Differential Attention              MTG Attention
+(Code 1)                           (Code 2)
+    │                                      │
+    ▼                                      ▼
+Two softmax maps,                  Standardize scores
+subtract them.                     before softmax.
+Noise cancels,                     Controls scale,
+signal survives.                   prevents saturation.
+    │                                      │
+    ▼                                      ▼
+Cost: 2× Q/K params               Cost: Zero extra params
+      + learnable α                      (just mean + var)
+```
+
+---
+
+# Part 2: MTG Attention — The Mechanism in Full Detail
+
+## 2.1 The Core Idea: Score Standardization
+
+MTG inserts a **statistical normalization** step between the raw attention scores and softmax:
+
+$$z_{ij} = \frac{q_i \cdot k_j}{\sqrt{C}} \quad \text{(standard scaled dot-product)}$$
+
+$$\hat{z}_{ij} = z_{ij} - \mu_i \quad \text{where } \mu_i = \frac{1}{T}\sum_{j=1}^T z_{ij} \quad \text{(mean centering)}$$
+
+$$\tilde{z}_{ij} = \frac{\hat{z}_{ij}}{\sqrt{\text{Var}_i(z) + \epsilon}} \quad \text{where } \text{Var}_i(z) = \frac{1}{T}\sum_{j=1}^T (z_{ij} - \mu_i)^2 \quad \text{(variance normalization)}$$
+
+$$\alpha_{ij} = \text{softmax}(\tilde{z})_{ij} \quad \text{(softmax on standardized scores)}$$
+
+This is essentially applying **z-score normalization** (standardization) to each row of the attention score matrix independently.
+
+## 2.2 Why Mean Centering?
+
+**Mean centering** shifts scores so their average is 0:
+
+$$\hat{z}_{ij} = z_{ij} - \frac{1}{T}\sum_{k=1}^T z_{ik}$$
+
+**Claim**: Mean centering has **no effect** on softmax output.
+
+**Proof**: 
+$$\text{softmax}(z_i - c)_j = \frac{e^{z_j - c}}{\sum_k e^{z_k - c}} = \frac{e^{-c} e^{z_j}}{e^{-c} \sum_k e^{z_k}} = \frac{e^{z_j}}{\sum_k e^{z_k}} = \text{softmax}(z)_j$$
+
+Softmax is **shift-invariant**! So mean centering alone changes nothing.
+
+> [!IMPORTANT]
+> **Then why include it?** Because mean centering is a **prerequisite for variance normalization**. The formula $\text{Var}(z) = \frac{1}{T}\sum(z_i - \mu)^2$ uses the mean. More importantly, after centering, the variance normalization divides by the **standard deviation of deviations from the mean**, which is the meaningful measure of score spread. Without centering first, dividing by $\sqrt{\text{Var}}$ would be dividing by a quantity that mixes location and spread information.
+
+## 2.3 Why Variance Normalization? — The Key Insight
+
+After mean centering, dividing by $\sqrt{\text{Var}(z) + \epsilon}$ sets the **standard deviation to 1**:
+
+$$\tilde{z} \sim \text{distribution with } \mu = 0, \sigma = 1$$
+
+This means the scores passed to softmax have a **controlled, bounded scale** regardless of what Q/K learned.
+
+### The Adaptive Temperature Interpretation
+
+Recall that softmax with temperature $\tau$:
+
+$$\text{softmax}(z/\tau)_i = \frac{e^{z_i/\tau}}{\sum_j e^{z_j/\tau}}$$
+
+- High $\tau$ → uniform (high entropy)
+- Low $\tau$ → peaked (low entropy)
+
+MTG's normalization is equivalent to applying an **adaptive, per-query temperature**:
+
+$$\tau_i^{\text{MTG}} = \text{std}_i(z) = \sqrt{\text{Var}_i(z)}$$
+
+```
+Query token i has scores:  [3.2, 0.1, -0.5, 8.7, 0.3]
+  std(z) = 3.24
+
+MTG normalization:  z / std(z) = [0.99, 0.03, -0.15, 2.68, 0.09]
+                    ≡ softmax(z / τ)  with τ = 3.24
+
+Compare with fixed temperature:
+  τ = 1 (standard):     softmax gives ~[0.004, 0.0002, 0.0001, 0.9955, 0.0002]  ← COLLAPSED
+  τ = 3.24 (MTG auto):  softmax gives ~[0.13, 0.05, 0.04, 0.70, 0.05]           ← HEALTHY
+```
+
+The beauty: **the temperature automatically adapts per query**:
+- Queries with high-variance scores (about to collapse) → get divided by large std → **cooled down**
+- Queries with low-variance scores (too uniform) → get divided by small std → **distinction preserved**
+
+This creates a **self-regulating feedback loop**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│   Score variance high? ──→ std(z) high ──→ divide by large  │
+│       (about to collapse)                  ──→ scores become│
+│                                             moderate ──→    │
+│                                             softmax is      │
+│                                             healthy ✓       │
+│                                                             │
+│   Score variance low? ──→ std(z) low ──→ divide by small    │
+│       (too uniform)                     ──→ scores become   │
+│                                          more spread ──→    │
+│                                          softmax maintains  │
+│                                          discrimination ✓   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 2.4 Complete Numerical Walkthrough: Standard vs MTG
+
+Let's trace through a concrete example with T=5 tokens (simplified from 65 for clarity).
+
+**Input scores** (one row — query token i attending to 5 keys):
+
+$$z = [12.0, \; 0.1, \; 0.2, \; 0.3, \; -0.5]$$
+
+### Standard Attention Path
+
+```
+Step 1: Softmax directly on z
+
+  e^z = [e^12.0, e^0.1, e^0.2, e^0.3, e^-0.5]
+      = [162754.8, 1.105, 1.221, 1.350, 0.607]
+
+  sum = 162759.1
+
+  softmax = [0.99997, 0.000007, 0.000008, 0.000008, 0.000004]
+
+  ❌ COLLAPSED — Token 0 gets 99.997% of attention!
+  Entropy H = 0.0003 (out of max log(5) = 1.61)
+```
+
+### MTG Attention Path
+
+```
+Step 1: Raw scores
+  z = [12.0, 0.1, 0.2, 0.3, -0.5]
+
+Step 2: Mean centering
+  μ = (12.0 + 0.1 + 0.2 + 0.3 + (-0.5)) / 5 = 12.1 / 5 = 2.42
+
+  ẑ = z - μ = [12.0 - 2.42, 0.1 - 2.42, 0.2 - 2.42, 0.3 - 2.42, -0.5 - 2.42]
+            = [9.58, -2.32, -2.22, -2.12, -2.92]
+
+Step 3: Variance computation (population variance, unbiased=False)
+  Var = (9.58² + (-2.32)² + (-2.22)² + (-2.12)² + (-2.92)²) / 5
+      = (91.78 + 5.38 + 4.93 + 4.49 + 8.53) / 5
+      = 115.11 / 5
+      = 23.02
+
+  std = √(23.02 + 1e-5) = 4.798
+
+Step 4: Normalize
+  z̃ = ẑ / std = [9.58/4.798, -2.32/4.798, -2.22/4.798, -2.12/4.798, -2.92/4.798]
+               = [1.997, -0.483, -0.463, -0.442, -0.608]
+
+Step 5: Softmax on normalized scores
+  e^z̃ = [e^1.997, e^-0.483, e^-0.463, e^-0.442, e^-0.608]
+       = [7.367, 0.617, 0.630, 0.643, 0.544]
+
+  sum = 9.801
+
+  softmax = [0.752, 0.063, 0.064, 0.066, 0.056]
+
+  ✅ HEALTHY — Token 0 still gets the most attention (75.2%) 
+  but other tokens are visible (6% each)!
+  Entropy H = 0.85 (much healthier than 0.0003)
+```
+
+### Side-by-Side Comparison
+
+```
+Token Index:       0        1        2        3        4
+
+Raw Scores:     12.000    0.100    0.200    0.300   -0.500
+
+Standard:       0.99997  0.00001  0.00001  0.00001  0.00000
+                ████████████████████████████████████████████
+                ▲ All weight here — others invisible
+
+MTG:            0.752    0.063    0.064    0.066    0.056
+                ████████████████████████
+                ▲ Dominant but not monopolizing — others visible
+
+Entropy:
+  Standard: H = 0.0003  (near-zero, attention collapsed)
+  MTG:      H = 0.85    (moderate, healthy attention)
+  Maximum:  H = 1.61    (uniform, no discrimination at all)
+```
+
+> [!TIP]
+> Notice that MTG doesn't make attention **uniform** — Token 0 still gets 75% of the weight! It preserves the model's learned preference but **prevents extreme saturation**. The discrimination is maintained, but the non-dominant tokens remain "visible" and their gradients remain non-zero.
+
+---
+
+# Part 3: The MTG Code — Line-by-Line Deep Dive
+
+## 3.1 MTGHead: Complete Annotated Implementation
+
+```python
+class MTGHead(nn.Module):
+    def __init__(self, head_size):    # head_size = 128/4 = 32
+        super().__init__()
+
+        # ---- Standard Q, K, V projections (SINGLE set, not dual) ----
+        self.key = nn.Linear(n_embd, head_size, bias=False)     # W_K: (128, 32)
+        self.query = nn.Linear(n_embd, head_size, bias=False)   # W_Q: (128, 32)
+        self.value = nn.Linear(n_embd, head_size, bias=False)   # W_V: (128, 32)
+
+        self.eps = 1e-5   # Prevents division by zero in normalization
+```
+
+**Parameter count per MTGHead:**
+- $W_Q$: $128 \times 32 = 4096$
+- $W_K$: $128 \times 32 = 4096$  
+- $W_V$: $128 \times 32 = 4096$
+- **Total: 12,288 per head** (vs 20,481 for DiffHead — **40% fewer parameters**)
+
+No learnable parameters for the MTG normalization itself — it's purely statistical.
+
+```python
+    def forward(self, x):
+        B, T, C = x.shape    # B=128 (batch), T=65 (tokens), C=128 (embedding)
+```
+
+### Step 1: Standard Q, K, V Projections
+
+```python
+        k = self.key(x)       # (128, 65, 128) @ (128, 32) → (128, 65, 32)
+        q = self.query(x)     # (128, 65, 128) @ (128, 32) → (128, 65, 32)
+```
+
+Each token's 128-dim embedding is projected into a 32-dim query and key space. Identical to standard attention.
+
+### Step 2: Compute Raw Attention Scores
+
+```python
+        wei = q @ k.transpose(-2, -1) * C**-0.5    # (128, 65, 32) @ (128, 32, 65) = (128, 65, 65)
+        #                                             ↑     ↑   ↑
+        #                                           batch  T×T attention matrix
+```
+
+This produces the raw attention score matrix. Entry `wei[b, i, j]` = how much token $i$ should attend to token $j$ in batch item $b$.
+
+> [!WARNING]
+> **Same scaling note as the Diff. Attn code**: Uses `C**-0.5` = $1/\sqrt{128}$ instead of the standard `head_size**-0.5` = $1/\sqrt{32}$. This makes initial scores ~2× smaller (since $\sqrt{128}/\sqrt{32} = 2$), which means initial softmax distributions are more uniform. In the context of MTG, this matters less because the variance normalization will re-scale anyway — but it does affect the **initial** variance that triggers the normalization.
+
+### Step 3: Mean Centering — The First MTG Step
+
+```python
+        wei = wei - wei.mean(dim=-1, keepdim=True)
+```
+
+**What this does, dimension by dimension:**
+
+```
+wei shape: (B, T, T) = (128, 65, 65)
+
+wei.mean(dim=-1, keepdim=True):
+  - Computes mean across the LAST dimension (the keys)
+  - For each (batch, query) pair, averages over all 65 key scores
+  - Shape: (128, 65, 1)    ← one mean per query token per batch
+
+wei - wei.mean(...):
+  - Broadcasting: (128, 65, 65) - (128, 65, 1)
+  - Each row gets its own mean subtracted
+  - After this, each row sums to 0
+```
+
+**Concrete example for one row:**
+
+```
+Before:  [3.2, 0.1, -0.5, 8.7, 0.3, -1.2, ...]
+Mean μ = 1.77
+
+After:   [1.43, -1.67, -2.27, 6.93, -1.47, -2.97, ...]
+         ↑ sum ≈ 0
+```
+
+### Step 4: Variance Normalization — The Critical MTG Step
+
+```python
+        var = wei.var(dim=-1, keepdim=True, unbiased=False)
+        wei = wei / torch.sqrt(var + self.eps)
+```
+
+**Detailed breakdown:**
+
+```python
+# var computation:
+wei.var(dim=-1, keepdim=True, unbiased=False)
+```
+
+```
+Computes POPULATION variance (not sample variance):
+
+  Var_i = (1/T) Σ_j (wei[i,j] - μ_i)²
+
+  But μ_i = 0 after mean centering! So:
+
+  Var_i = (1/T) Σ_j wei[i,j]²    ← just the mean of squares
+
+Shape: (128, 65, 1)    ← one variance per query
+
+
+# Division:
+wei / torch.sqrt(var + self.eps)
+```
+
+```
+torch.sqrt(var + 1e-5):
+  - Adds epsilon for numerical stability (prevents NaN if variance = 0)
+  - Takes square root → standard deviation
+  - Shape: (128, 65, 1)
+
+Division by broadcasting:
+  (128, 65, 65) / (128, 65, 1)
+  Each row is divided by its own standard deviation
+  After this: each row has mean ≈ 0, variance ≈ 1
+```
+
+**Why `unbiased=False`?**
+
+```python
+# unbiased=True  (Bessel's correction): divides by T-1, estimates population var from sample
+# unbiased=False (population variance): divides by T, treats the row AS the population
+
+# Here T=65 (the number of keys). We're not sampling — we have ALL keys.
+# The full attention score row IS the population, so population variance is correct.
+
+# Numerical difference is tiny: 1/65 vs 1/64, but using unbiased=False also avoids
+# a potential edge case if T=1 (where T-1=0 would cause division by zero).
+```
+
+### Step 5: Softmax on Standardized Scores
+
+```python
+        wei = F.softmax(wei, dim=-1)    # (128, 65, 65)
+```
+
+Now softmax receives inputs with controlled statistics ($\mu \approx 0$, $\sigma \approx 1$), regardless of what the Q/K projections have learned.
+
+**What this means for the output distribution:**
+
+Since inputs to softmax have unit variance, the effective temperature is always ~1. The resulting attention weights will be "moderately peaked" — not uniform, not collapsed — satisfying:
+
+$$H(\text{softmax}(\tilde{z})) \in [\text{moderate}, \text{moderate}]$$
+
+Rather than the uncontrolled range $[0, \log T]$ of standard attention.
+
+### Step 6: Weighted Sum of Values
+
+```python
+        v = self.value(x)     # (128, 65, 32)
+        out = wei @ v         # (128, 65, 65) @ (128, 65, 32) = (128, 65, 32)
+
+        return out, wei       # Return both output and attention weights (for SR analysis)
+```
+
+Standard value aggregation. Each token's output is a weighted combination of all value vectors, where weights come from the MTG-normalized attention.
+
+---
+
+## 3.2 The Full MTG Attention Pipeline — Visual Summary
+
+```
+   Input x: (B, 65, 128)
+       │
+       ├──────────────────────┐────────────────────┐
+       │                      │                    │
+       ▼                      ▼                    ▼
+   Q = x·W_Q              K = x·W_K            V = x·W_V
+   (B, 65, 32)            (B, 65, 32)          (B, 65, 32)
+       │                      │                    │
+       └──────┬───────────────┘                    │
+              │                                    │
+              ▼                                    │
+       wei = QKᵀ / √C                             │
+       (B, 65, 65)                                 │
+              │                                    │
+              ▼                                    │
+   ┌──────────────────────┐                        │
+   │    MTG BLOCK          │                        │
+   │                       │                        │
+   │  1. Mean Center       │                        │
+   │     wei -= mean(wei)  │                        │
+   │                       │                        │
+   │  2. Var Normalize     │                        │
+   │     wei /= √(var+ε)   │                        │
+   │                       │                        │
+   │  Properties after:    │                        │
+   │   • mean ≈ 0 per row  │                        │
+   │   • var ≈ 1 per row   │                        │
+   │   • scale-invariant   │                        │
+   └──────────┬───────────┘                        │
+              │                                    │
+              ▼                                    │
+       Softmax (dim=-1)                            │
+       (B, 65, 65)                                 │
+              │                                    │
+              ▼                                    │
+       Healthy attention                           │
+       probabilities!                              │
+              │                                    │
+              └───────────┬────────────────────────┘
+                          │
+                          ▼
+                    out = wei @ V
+                    (B, 65, 32)
+```
+
+---
+
+# Part 4: Gradient Flow Through MTG
+
+## 4.1 Why Gradient Health Matters
+
+For training to work, gradients must flow from the loss back through the attention mechanism to update $W_Q$ and $W_K$. Let's trace the gradient path through MTG.
+
+## 4.2 Gradient Through Softmax
+
+The Jacobian of softmax for output $p = \text{softmax}(z)$:
+
+$$\frac{\partial p_i}{\partial z_j} = p_i(\delta_{ij} - p_j)$$
+
+**Standard attention (collapsed):** When $p_k \approx 1, p_{j \neq k} \approx 0$:
+$$\frac{\partial p_k}{\partial z_k} = p_k(1 - p_k) \approx 1 \times 0 = 0 \quad \text{← VANISHING!}$$
+
+**MTG attention:** When $p_k \approx 0.7, p_j \approx 0.06$:
+$$\frac{\partial p_k}{\partial z_k} = 0.7 \times 0.3 = 0.21 \quad \text{← HEALTHY!}$$
+
+MTG prevents softmax saturation, which directly keeps gradients **non-zero**.
+
+## 4.3 Gradient Through Variance Normalization
+
+Let $\tilde{z} = \hat{z} / \sigma$ where $\sigma = \sqrt{\text{Var}(\hat{z}) + \epsilon}$.
+
+The gradient of the normalization step:
+
+$$\frac{\partial \tilde{z}_j}{\partial \hat{z}_i} = \frac{1}{\sigma}\left(\delta_{ij} - \frac{1}{T} - \frac{\tilde{z}_j \tilde{z}_i}{T}\right)$$
+
+Key properties:
+1. **Scaling factor $1/\sigma$**: When scores have high variance, $\sigma$ is large, so gradients are **dampened** → prevents gradient explosion
+2. **When scores have low variance**, $\sigma$ is small, so gradients are **amplified** → prevents gradient vanishing
+3. This is the same gradient conditioning that makes **BatchNorm/LayerNorm** so effective — MTG applies it **within the attention mechanism itself**
+
+```
+Gradient Flow Comparison:
+
+Standard Attention:
+  Loss → softmax grad (often ~0 due to saturation) → Q,K grads ≈ 0
+  ▲ DEAD END — model stops learning attention patterns
+
+MTG Attention:
+  Loss → softmax grad (healthy, ~0.2) → normalization grad → Q,K grads (scaled by 1/σ)
+  ▲ ALIVE — model continues refining attention patterns
+```
+
+## 4.4 The Implicit Regularization Effect
+
+MTG's normalization creates an **implicit learning rate schedule** for the attention logits:
+
+$$\text{Effective LR for attention} \propto \frac{\text{base LR}}{\sigma_i}$$
+
+- Early in training: scores have small variance → $\sigma$ small → effective LR is **higher** → fast initial learning
+- Late in training: scores have larger variance → $\sigma$ larger → effective LR is **lower** → fine-tuning without destabilization
+
+This is analogous to Adam's adaptive learning rates, but applied specifically to the attention score computation.
+
+---
+
+# Part 5: Architecture Differences — MTG vs Differential Transformer
+
+## 5.1 Model Architecture Comparison
+
+```
+┌─────────────────────────────┐    ┌─────────────────────────────┐
+│   Code 1: Differential ViT  │    │    Code 2: MTG ViT           │
+│                              │    │                              │
+│  PatchEmbed(3→128, k=4)     │    │  PatchEmbed(3→128, k=4)     │
+│  [CLS] + PosEmbed           │    │  [CLS] + PosEmbed           │
+│  ┌────────────────────────┐  │    │  ┌────────────────────────┐  │
+│  │  Block 0 (DiffAttn)    │  │    │  │  Block 0 (MTGAttn)     │  │
+│  │  Block 1 (DiffAttn)    │  │    │  │  Block 1 (MTGAttn)     │  │
+│  │  Block 2 (DiffAttn)    │  │    │  │  Block 2 (MTGAttn)     │  │
+│  │  Block 3 (DiffAttn)    │  │    │  │  Block 3 (MTGAttn)     │  │
+│  │  Block 4 (DiffAttn)    │  │    │  └────────────────────────┘  │
+│  │  Block 5 (DiffAttn)    │  │    │  Final LN → CLS → Linear    │
+│  └────────────────────────┘  │    │                              │
+│  Final LN → CLS → Linear    │    │  Layers: 4                   │
+│                              │    │  SR every: 10 steps          │
+│  Layers: 6                   │    │                              │
+│  SR every: 50 steps          │    │                              │
+└─────────────────────────────┘    └─────────────────────────────┘
+```
+
+## 5.2 Per-Head Parameter Comparison
+
+| Component | DiffHead | MTGHead | Difference |
+|---|---|---|---|
+| Query projection(s) | 2 × (128×32) = 8,192 | 1 × (128×32) = 4,096 | DiffHead has 2× |
+| Key projection(s) | 2 × (128×32) = 8,192 | 1 × (128×32) = 4,096 | DiffHead has 2× |
+| Value projection | 1 × (128×32) = 4,096 | 1 × (128×32) = 4,096 | Same |
+| Learnable α | 1 | 0 | DiffHead only |
+| MTG normalization | 0 | 0 (no params!) | — |
+| **Total per head** | **20,481** | **12,288** | **DiffHead is 67% larger** |
+
+## 5.3 Full Model Parameter Count — MTG ViT
+
+| Component | Parameters | Calculation |
+|---|---|---|
+| **Patch Embedding** | | |
+| Conv2d weights | 6,144 | $3 \times 128 \times 4 \times 4$ |
+| Conv2d bias | 128 | 128 output channels |
+| **Subtotal** | **6,272** | |
+| | | |
+| **Special Tokens** | | |
+| CLS token | 128 | $1 \times 128$ |
+| Positional embedding | 8,320 | $65 \times 128$ |
+| **Subtotal** | **8,448** | |
+| | | |
+| **Per MTG Head** | | |
+| W_Q | 4,096 | $128 \times 32$ |
+| W_K | 4,096 | $128 \times 32$ |
+| W_V | 4,096 | $128 \times 32$ |
+| **Subtotal** | **12,288** | |
+| | | |
+| **Per MultiHeadAttention** | | |
+| 4 × MTGHead | 49,152 | $4 \times 12288$ |
+| Output proj (weight) | 16,384 | $128 \times 128$ |
+| Output proj (bias) | 128 | 128 |
+| **Subtotal** | **65,664** | |
+| | | |
+| **Per FFN** | | |
+| Linear1 (weight) | 65,536 | $128 \times 512$ |
+| Linear1 (bias) | 512 | |
+| Linear2 (weight) | 65,536 | $512 \times 128$ |
+| Linear2 (bias) | 128 | |
+| **Subtotal** | **131,712** | |
+| | | |
+| **Per LayerNorm** | | |
+| γ (scale) | 128 | |
+| β (shift) | 128 | |
+| **Subtotal** | **256** | |
+| | | |
+| **Per LNBlock** | | |
+| MHA + FFN + 2×LN | — | 65,664 + 131,712 + 2×256 |
+| **Subtotal** | **197,888** | |
+| | | |
+| **4 Blocks** | **791,552** | $4 \times 197888$ |
+| | | |
+| **Classification Head** | | |
+| Final LayerNorm | 256 | |
+| Linear (weight) | 1,280 | $128 \times 10$ |
+| Linear (bias) | 10 | |
+| **Subtotal** | **1,546** | |
+| | | |
+| **GRAND TOTAL** | **~807,818** | ≈ 808K parameters |
+
+### Comparison with Differential Transformer
+
+| | Differential ViT (Code 1) | MTG ViT (Code 2) |
+|---|---|---|
+| Layers | 6 | 4 |
+| Params per head (attn) | 20,481 | 12,288 |
+| Params per block | ~230K | ~198K |
+| **Total parameters** | **~1.4M** | **~808K** |
+| **Ratio** | 1.73× larger | baseline |
+
+The MTG model is **42% smaller** — partly from fewer layers (4 vs 6), and partly from single Q/K projections per head instead of double.
+
+---
+
+# Part 6: Training Loop — What's Different
+
+## 6.1 SR Logging Frequency
+
+```python
+compute_sr = (step % 10 == 0)    # MTG: every 10 steps
+# vs
+compute_sr = (step % 50 == 0)    # DiffAttn: every 50 steps
+```
+
+**Impact on training data:**
+
+| Metric | Diff. ViT (Code 1) | MTG ViT (Code 2) |
+|---|---|---|
+| Steps per epoch | ~391 | ~391 |
+| Total steps (5 epochs) | ~1,955 | ~1,955 |
+| SR data points | ~39 | **~195** |
+| SR plot density | Sparse | **5× denser** |
+| SVD overhead per step | 0.26% of steps | **10% of steps** |
+
+More frequent SR logging gives smoother, more informative plots but adds SVD computation overhead. Since the MTG model has 4 layers (vs 6), each SR computation involves fewer SVDs, partially offsetting the increased frequency.
+
+**SVD computations per SR step:**
+- Code 1: $B \times 2 = 128 \times 2 = 256$ SVDs × 6 layers = 1,536 SVDs every 50 steps
+- Code 2: $B \times 2 = 128 \times 2 = 256$ SVDs × 4 layers = 1,024 SVDs every 10 steps
+
+**SVD computations per epoch:**
+- Code 1: $\lfloor 391/50 \rfloor \times 1536 \approx 12,000$ SVDs/epoch
+- Code 2: $\lfloor 391/10 \rfloor \times 1024 \approx 40,000$ SVDs/epoch
+
+So despite fewer layers, Code 2 does ~3.3× more SVD computation per epoch due to the 5× higher logging frequency.
+
+## 6.2 Per-Layer SR Storage
+
+```python
+per_layer_sr_history = [[] for _ in range(n_layer)]    
+# Code 1: [[], [], [], [], [], []]    ← 6 lists (6 layers)
+# Code 2: [[], [], [], []]            ← 4 lists (4 layers)
+```
+
+The per-layer plot will show 4 lines instead of 6.
+
+---
+
+# Part 7: Expected Behavior & Plot Interpretation
+
+## 7.1 What to Expect from MTG vs Standard vs Differential Attention
+
+### Stable Rank Behavior
+
+```
+Stable Rank over Training
+
+Standard Attention (no fix):
+  │
+  │ ─────────╲
+  │           ╲──────╲
+  │                   ╲───── → Collapses toward 1
+  └──────────────────────────── Steps
+
+Differential Attention:
+  │
+  │     ╱──╲      ╱╲
+  │ ───╱    ╲────╱  ╲───── → Moderate, some oscillation
+  │                         (noise cancellation can be volatile)  
+  └──────────────────────────── Steps
+
+MTG Attention:
+  │
+  │ ──────────────────────── → Stable, moderate, flat
+  │                            (self-regulating temperature)
+  └──────────────────────────── Steps
+```
+
+**Why MTG should be more stable**: The variance normalization acts as a **homeostatic mechanism** — it automatically compensates for any tendency toward collapse, keeping scores in a controlled range. Differential Attention's subtraction can amplify instabilities if the two branches diverge significantly.
+
+### Gradient Norm Behavior
+
+```
+MTG Expected:
+  │
+  │ ╱╲╱╲
+  │╱    ╲╱╲╱╲╱╲╱╲╱── → Smooth, gradual decrease
+  └──────────────────── Steps
+
+  Should be smoother than Differential Attention because:
+  1. Normalization provides consistent gradient magnitudes
+  2. No subtraction step that can create sharp gradient changes
+  3. Implicit adaptive LR effect dampens late-training oscillations
+```
+
+### Training Loss
+
+Both codes should show similar loss curves since they're on the same task (CIFAR-10 classification). However:
+- MTG with 4 layers has fewer parameters → might converge to a **slightly higher** final loss
+- But the healthier attention patterns could compensate → hard to predict without running both
+
+## 7.2 Per-Layer Stable Rank Patterns
+
+```
+Expected per-layer SR for MTG ViT (4 layers):
+
+Stable Rank
+  │
+  │  Layer 0 ──────────────────── (highest: early features, broad attention)
+  │  Layer 1 ────────────────── 
+  │  Layer 2 ──────────────
+  │  Layer 3 ────────────         (lowest: classification-focused, more selective)
+  │
+  └──────────────────────── Steps
+
+Key characteristic: ALL layers should stay WELL ABOVE 1
+(MTG's normalization prevents any layer from collapsing)
+```
+
+With standard attention, you might see:
+```
+  Layer 3 ──╲
+             ╲──── → 1.0  (collapsed in deep layer)
+```
+
+MTG prevents this by ensuring softmax inputs always have unit variance.
+
+---
+
+# Part 8: MTG vs Differential Attention — When to Use Which?
+
+## 8.1 Decision Matrix
+
+| Criterion | Choose Differential Attn | Choose MTG |
+|---|---|---|
+| Parameter budget | Unlimited | Tight |
+| Compute budget | Have spare GPU | Need efficiency |
+| Noise type | Structured, correlated | Random, scale-related |
+| Need negative attention? | Yes (inhibition) | No |
+| Want simplicity? | No (more complex) | **Yes** (drop-in replacement) |
+| Interpretability | Want to visualize noise cancellation | Want to understand via statistics |
+| Existing codebase | Can modify attention significantly | Want minimal code change |
+
+## 8.2 Implementation Effort
+
+**Adding Differential Attention** to existing code:
+```python
+# Need to: double Q/K projections, add alpha parameter, 
+# compute two softmax maps, subtract them
+# Changes: ~20 lines of code, +67% parameters per head
+```
+
+**Adding MTG** to existing code:
+```python
+# Need to: add 3 lines between QK^T and softmax
+wei = wei - wei.mean(dim=-1, keepdim=True)           # +1 line
+var = wei.var(dim=-1, keepdim=True, unbiased=False)   # +1 line
+wei = wei / torch.sqrt(var + 1e-5)                    # +1 line
+# Changes: 3 lines of code, 0 extra parameters
+```
+
+> [!TIP]
+> MTG is arguably the most "bang for your buck" attention improvement available — 3 lines of code, zero parameters, and significant improvement in attention health. It can be added to **any** existing attention implementation as a drop-in modification.
+
+---
+
+# Part 9: Relationship to Other Normalization Techniques
+
+## 9.1 Family of Normalizations in Deep Learning
+
+```
+                    Normalization in Deep Learning
+                              │
+        ┌─────────┬───────────┼───────────────┬──────────┐
+        │         │           │               │          │
+     BatchNorm  LayerNorm  InstanceNorm  GroupNorm    MTG
+   (across batch) (across   (per channel  (groups of  (across
+                  features)  per sample)   channels)   keys)
+        │         │           │               │          │
+        ▼         ▼           ▼               ▼          ▼
+    Normalizes Normalizes  Normalizes    Normalizes  Normalizes
+    over N,H,W over C      over H,W      over C/G    over T
+    (training   (per token) (per channel) (per group) (per query)
+     statistics)
+```
+
+## 9.2 MTG is LayerNorm Applied to Attention Logits
+
+The connection is direct:
+
+| Aspect | LayerNorm (on activations) | MTG (on attention scores) |
+|---|---|---|
+| Applied to | Hidden states $x \in \mathbb{R}^C$ | Score row $z_i \in \mathbb{R}^T$ |
+| Computes | $\mu, \sigma$ across C features | $\mu, \sigma$ across T keys |
+| Output | $(x - \mu)/\sigma \cdot \gamma + \beta$ | $(z - \mu)/\sigma$ (no affine!) |
+| Learnable params | $\gamma, \beta$ (2C params) | **None** |
+| Purpose | Stabilize activations | Stabilize attention distribution |
+
+The key difference: MTG has **no learnable $\gamma$ and $\beta$**. This is intentional — adding learnable scale/shift after normalization would let the model "undo" the normalization and re-collapse. By omitting them, the normalization is **enforced unconditionally**.
+
+> [!IMPORTANT]
+> This is a deliberate design choice. Standard LayerNorm includes $\gamma$ and $\beta$ because the normalized activations need to be rescaled for downstream layers. But MTG's normalized scores go directly to softmax, which adds its own non-linearity. Adding learnable scale would be equivalent to a learnable temperature — which the model could learn to set very high, defeating the purpose.
+
+---
+
+# Summary
+
+```
+MTG Attention in One Diagram:
+
+  Q, K projections (standard, single set)
+        │
+        ▼
+  QKᵀ/√C  →  Raw attention scores
+        │
+  ┌─────┴──────────────────────────┐
+  │         MTG BLOCK               │
+  │                                 │
+  │  1. Subtract row mean           │  ← Centers at 0
+  │  2. Divide by row std           │  ← Normalizes variance to 1
+  │                                 │
+  │  Effect: Adaptive temperature   │
+  │  that prevents softmax          │
+  │  saturation automatically       │
+  │                                 │
+  │  Cost: 0 parameters, ~0 FLOPS  │
+  └─────┬──────────────────────────┘
+        │
+        ▼
+  Softmax  →  Healthy attention weights
+        │
+        ▼
+  Weighted sum with V  →  Output
+```
+
+| What | How | Why |
+|---|---|---|
+| Prevents collapse | Variance normalization → unit std → bounded softmax input | Softmax can't saturate if inputs are bounded |
+| Zero param cost | Just mean + var computation | No learnable parameters needed |
+| Self-regulating | High score variance → large σ → divided by more → dampened | Automatic homeostasis |
+| Preserves discrimination | Relative ordering of scores is maintained | Normalization is monotonic |
+| Better gradients | Non-saturated softmax → non-zero Jacobian | Model keeps learning throughout training |
+| Drop-in replacement | 3 lines of code between QKᵀ and softmax | Works with any attention variant |
