@@ -105,7 +105,7 @@ where $F$ is a function of the activation nonlinearity. There are two phases:
 - **Chaotic phase**: Small input differences get amplified (gradient explosion).
 - **Edge of chaos**: A critical initialization where information propagates faithfully.
 
-**Connection to your work**: Stable rank tracks whether the Transformer attention operates near the "edge of chaos" — high SR = information diversity, low SR = ordered/collapsed phase.
+**Connection to our work**: Stable rank tracks whether the Transformer attention operates near the "edge of chaos" — high SR = information diversity, low SR = ordered/collapsed phase.
 
 #### 3. Random Matrix Theory Connection
 For a random i.i.d. matrix $M$ with entries $\sim \mathcal{N}(0, 1/n)$, the singular value distribution follows the **Marchenko-Pastur law**:
@@ -149,8 +149,8 @@ But none of them used **stable rank** as their primary quantitative metric. They
 - Loss curves (task-specific, not a diagnostic)
 - Gradient norms (indirect)
 
-#### Your Novelty: Using Stable Rank as the Diagnostic
-You chose **stable rank** because:
+#### Our Novelty: Using Stable Rank as the Diagnostic
+We chose **stable rank** because:
 1. It directly captures the **spectral structure** of the attention matrix (not just per-row entropy).
 2. It has a clear **signal processing interpretation** (effective number of modes).
 3. It is **differentiable and continuous** (unlike rank).
