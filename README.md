@@ -73,7 +73,7 @@ Consequences:
 
 #### 1. Stable Rank as an Information Metric
 The **stable rank** of a matrix $M$ is defined as:
-$$\text{sr}(M) = \frac{\|M\|_F^2}{\|M\|_2^2} = \frac{\sum_i \sigma_i^2}{\sigma_{\max}^2}$$
+$$\text{sr}(M) = \frac{||M||_F^2}{||M||_2^2} = \frac{\sum_i \sigma_i^2}{\sigma_{max}^2}$$
 where $\sigma_i$ are singular values (from SVD: $M = U \Sigma V^T$).
 
 **Where does this come from?**
