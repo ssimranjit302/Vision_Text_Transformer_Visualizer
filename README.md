@@ -47,7 +47,9 @@ This question bridges two disciplines:
 
 #### The Vanishing/Exploding Information Problem
 In a deep network with $L$ layers, the representation at layer $l$ is:
+
 $$x^{(l)} = f_l(x^{(l-1)})$$
+
 where $f_l$ is a composite of attention + FFN. The concern is whether $x^{(L)}$ (the final representation) retains meaningful, diverse information from $x^{(0)}$ (the input).
 
 **Analogy to Communication Engineering:**
@@ -60,7 +62,9 @@ In a Transformer:
 
 #### Why "Attention Collapse" Happens
 Standard softmax attention:
+
 $$A_{ij} = \text{softmax}\left( \frac{Q_i \cdot K_j}{\sqrt{d_k}} \right)$$
+
 As training progresses, softmax tends to **sharpen** — the argmax token gets weight → 1, all others → 0. This is called **attention entropy collapse** or **rank collapse**.
 
 Consequences:
@@ -73,7 +77,9 @@ Consequences:
 
 #### 1. Stable Rank as an Information Metric
 The **stable rank** of a matrix $M$ is defined as:
-$$\text{sr}(M) = \frac{||M||_F^2}{||M||_2^2} = \frac{\sum_i \sigma_i^2}{\sigma_{max}^2}$$
+
+$$\text{sr}(M) = \frac{|M|_F^2}{|M|_2^2} = \frac{\sum_i \sigma_i^2}{\sigma_{max}^2}$$
+
 where $\sigma_i$ are singular values (from SVD: $M = U \Sigma V^T$).
 
 **Where does this come from?**
@@ -99,7 +105,9 @@ The stable rank $\text{sr}(M) \in [1, \min(m,n)]$:
 Mean Field Theory (MFT) studies signal propagation in the limit of infinite width. Key result (Poole et al. 2016, "Exponential Expressivity"):
 
 At initialization, for a network with weight variance $\sigma_w^2$ and bias variance $\sigma_b^2$, the **order parameter** $q^l$ (mean squared activation) evolves as:
+
 $$q^{(l)} = \sigma_w^2 \cdot F(q^{(l-1)}) + \sigma_b^2$$
+
 where $F$ is a function of the activation nonlinearity. There are two phases:
 - **Ordered phase**: $q^l \to$ fixed point regardless of input (all inputs map to same output — information loss).
 - **Chaotic phase**: Small input differences get amplified (gradient explosion).
@@ -109,7 +117,9 @@ where $F$ is a function of the activation nonlinearity. There are two phases:
 
 #### 3. Random Matrix Theory Connection
 For a random i.i.d. matrix $M$ with entries $\sim \mathcal{N}(0, 1/n)$, the singular value distribution follows the **Marchenko-Pastur law**:
+
 $$\rho(\sigma) = \frac{1}{2\pi} \frac{\sqrt{(\sigma_{\max} - \sigma)(\sigma - \sigma_{\min})}}{\sigma}$$
+
 where $\sigma_{\max} = (1 + \sqrt{\gamma})^2$, $\sigma_{\min} = (1 - \sqrt{\gamma})^2$, $\gamma = m/n$.
 
 This gives a **baseline expected stable rank** for random (untrained) weights, against which trained attention matrices can be compared.
@@ -119,7 +129,9 @@ This gives a **baseline expected stable rank** for random (untrained) weights, a
 ### 1.4 Problem Statement (Formal)
 
 Given a Transformer with $L$ layers, at training step $t$, the attention map at layer $l$ for a batch of $B$ tokens of length $T$ is:
+
 $$A^{(l)} \in \mathbb{R}^{B \times H \times T \times T}$$
+
 where $H$ = number of attention heads.
 
 **Research Problem:**
